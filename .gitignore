@@ -216,3 +216,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+#local database
+data/
+*.db
+*.db-journal
+*.db-wal
+*db-shm
+
+#Python cache
+__pycache__/
+*.pyc
+
+#Environment files
+.env
+.venv/
+venv/
