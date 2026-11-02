@@ -1,46 +1,27 @@
 
-import os
-import json
 import sqlite3
-import secrets
-
+import json
 from pathlib import Path
-from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
-import base64
+
+import utils
 
 
 class Vault:
-    """Encrypted local password database."""
+    """Manages the local SQLite password database."""
+
+    CHECK_VALUE = "jamasp-vault-check-v1"
 
     def __init__(self, connection, key):
         self.connection = connection
-        self.cipher = Fernet(key)
-
-    @staticmethod
-    def _derive_key(master_password, salt):
-        # Derive an encryption key with Argon2id
-        kdf = Argon2id(
-            salt=salt,
-            length=32,
-            iterations=3,
-            lanes=4,
-            memory_cost=65536
-        )
-
-        raw_key = kdf.derive(master_password.encode("utf-8"))
-        return base64.urlsafe_b64encode(raw_key)
+        self.key = key
 
     @staticmethod
     def _connect(db_path):
         path = Path(db_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Restrict the data directory on Unix-like systems
-        if os.name == "posix":
-            os.chmod(path.parent, 0o700)
-
         connection = sqlite3.connect(path)
+
         connection.execute("PRAGMA secure_delete = ON")
         connection.execute("PRAGMA journal_mode = DELETE")
         connection.execute("PRAGMA synchronous = FULL")
@@ -51,7 +32,6 @@ class Vault:
 
     @classmethod
     def create(cls, db_path, master_password):
-        # Validate the master password
         if not isinstance(master_password, str) or len(master_password) < 12:
             raise ValueError("Master password must be at least 12 characters")
 
@@ -63,10 +43,11 @@ class Vault:
         connection, path = cls._connect(path)
 
         try:
-            salt = secrets.token_bytes(16)
-            key = cls._derive_key(master_password, salt)
-            cipher = Fernet(key)
+            # Use the existing functions from utils.py
+            salt = utils.salt()
+            key = utils.encryption_key(master_password, salt)
 
+            # Create database tables
             connection.execute("""
                 CREATE TABLE metadata (
                     name TEXT PRIMARY KEY,
@@ -81,8 +62,13 @@ class Vault:
                 )
             """)
 
-            check_token = cipher.encrypt(b"jamasp-vault-check-v1")
+            # Encrypt a verification value
+            check_token = utils.password_encryption(
+                key,
+                cls.CHECK_VALUE
+            )
 
+            # Save database metadata
             connection.executemany(
                 "INSERT INTO metadata (name, value) VALUES (?, ?)",
                 [
@@ -93,10 +79,6 @@ class Vault:
             )
 
             connection.commit()
-
-            # Restrict database file permissions
-            if os.name == "posix":
-                os.chmod(path, 0o600)
 
             return cls(connection, key)
 
@@ -110,33 +92,39 @@ class Vault:
 
     @classmethod
     def unlock(cls, db_path, master_password):
-        connection, path = cls._connect(db_path)
+        path = Path(db_path).expanduser().resolve()
+
+        if not path.is_file():
+            raise FileNotFoundError("Vault database not found")
+
+        connection, path = cls._connect(path)
 
         try:
-            rows = dict(connection.execute(
-                "SELECT name, value FROM metadata"
-            ).fetchall())
+            rows = dict(
+                connection.execute(
+                    "SELECT name, value FROM metadata"
+                ).fetchall()
+            )
 
             salt = rows["salt"]
             check_token = rows["check_token"]
 
-            key = cls._derive_key(master_password, salt)
-            cipher = Fernet(key)
+            # Recreate the same encryption key
+            key = utils.encryption_key(master_password, salt)
 
-            # Check the master password
-            check_value = cipher.decrypt(check_token)
+            # Verify the master password
+            check_value = utils.Decoding(key, check_token)
 
-            if check_value != b"jamasp-vault-check-v1":
+            if check_value != cls.CHECK_VALUE:
                 raise ValueError("Invalid master password")
 
             return cls(connection, key)
 
-        except (InvalidToken, KeyError, sqlite3.Error, ValueError) as error:
+        except Exception as error:
             connection.close()
             raise ValueError("Cannot unlock vault") from error
 
     def add_entry(self, service, username, password, notes=""):
-        # Prepare the record
         record = {
             "service": service,
             "username": username,
@@ -144,13 +132,17 @@ class Vault:
             "notes": notes
         }
 
+        # Convert the record to JSON
         plain_data = json.dumps(
             record,
             ensure_ascii=False
-        ).encode("utf-8")
+        )
 
-        # Encrypt the complete record
-        encrypted_data = self.cipher.encrypt(plain_data)
+        # Use the existing encryption function
+        encrypted_data = utils.password_encryption(
+            self.key,
+            plain_data
+        )
 
         self.connection.execute(
             "INSERT INTO entries (encrypted_data) VALUES (?)",
@@ -167,8 +159,13 @@ class Vault:
         records = []
 
         for entry_id, encrypted_data in rows:
-            plain_data = self.cipher.decrypt(encrypted_data)
-            record = json.loads(plain_data.decode("utf-8"))
+            # Use the existing decryption function
+            plain_data = utils.Decoding(
+                self.key,
+                encrypted_data
+            )
+
+            record = json.loads(plain_data)
 
             records.append({
                 "id": entry_id,
@@ -182,6 +179,7 @@ class Vault:
             "DELETE FROM entries WHERE id = ?",
             (entry_id,)
         )
+
         self.connection.commit()
 
     def close(self):
